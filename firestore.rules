@@ -1,0 +1,153 @@
+rules_version = '2';
+// Safarnama — Firestore security rules. Paste into Firebase console → Firestore → Rules → Publish.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function me() { return request.auth.uid; }
+    function userDoc(uid) { return get(/databases/$(database)/documents/users/$(uid)).data; }
+    function strMax(v, n) { return v is string && v.size() <= n; }
+    function strRange(v, a, b) { return v is string && v.size() >= a && v.size() <= b; }
+    function intRange(v, a, b) { return v is int && v >= a && v <= b; }
+    function postDoc(postId) { return /databases/$(database)/documents/posts/$(postId); }
+    function likeDoc(postId) { return /databases/$(database)/documents/posts/$(postId)/likes/$(request.auth.uid); }
+
+    // ---------- usernames: uniqueness registry ----------
+    match /usernames/{name} {
+      allow read: if true;
+      allow create: if signedIn()
+        && name.matches('^[a-z0-9_.]{3,20}$')
+        && request.resource.data.keys().hasOnly(['uid'])
+        && request.resource.data.uid == me()
+        && getAfter(/databases/$(database)/documents/users/$(me())).data.username == name;
+      allow delete: if signedIn() && resource.data.uid == me();
+      allow update: if false;
+    }
+
+    // ---------- users ----------
+    function validUser(d) {
+      return d.keys().hasOnly(['uid','username','name','photoURL','bio','homeCity','createdAt'])
+        && d.keys().hasAll(['uid','username','name','photoURL','bio','homeCity','createdAt'])
+        && strRange(d.name, 1, 50)
+        && strMax(d.photoURL, 500)
+        && strMax(d.bio, 160)
+        && strMax(d.homeCity, 60)
+        && d.username is string;
+    }
+    match /users/{uid} {
+      allow read: if true;
+      allow create: if signedIn() && uid == me()
+        && validUser(request.resource.data)
+        && request.resource.data.uid == uid
+        && request.resource.data.createdAt == request.time
+        && getAfter(/databases/$(database)/documents/usernames/$(request.resource.data.username)).data.uid == uid;
+      allow update: if signedIn() && uid == me()
+        && validUser(request.resource.data)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name','bio','homeCity','photoURL']);
+      allow delete: if signedIn() && uid == me();
+
+      match /saved/{postId} {
+        allow read, delete: if signedIn() && uid == me();
+        allow create, update: if signedIn() && uid == me()
+          && request.resource.data.keys().hasOnly(['savedAt'])
+          && request.resource.data.savedAt == request.time;
+      }
+    }
+
+    // ---------- posts ----------
+    function validPost(d) {
+      return d.keys().hasOnly(['uid','authorName','authorUsername','authorPhoto','title','destination','destKey','startCity','month','days','people','tripType','travelMode','costPerHead','breakdown','highlights','tips','places','photos','source','likeCount','createdAt','updatedAt'])
+        && d.keys().hasAll(['uid','authorName','authorUsername','authorPhoto','title','destination','destKey','startCity','month','days','people','tripType','travelMode','costPerHead','breakdown','highlights','tips','places','photos','source','likeCount','createdAt'])
+        && strRange(d.title, 3, 90)
+        && strRange(d.destination, 2, 60)
+        && d.destKey is string && d.destKey.matches('^[a-z0-9 ]{1,60}$')
+        && strRange(d.startCity, 2, 60)
+        && d.month is string && d.month.matches('^[0-9]{4}-(0[1-9]|1[0-2])$')
+        && intRange(d.days, 1, 90)
+        && intRange(d.people, 1, 50)
+        && d.tripType in ['solo','friends','couple','family','group']
+        && d.travelMode in ['train','bus','flight','car','bike','mixed']
+        && intRange(d.costPerHead, 1, 10000000)
+        && d.breakdown is map
+        && d.breakdown.keys().hasOnly(['stay','travel','food','activities','other'])
+        && intRange(d.breakdown.get('stay', 0), 0, 10000000)
+        && intRange(d.breakdown.get('travel', 0), 0, 10000000)
+        && intRange(d.breakdown.get('food', 0), 0, 10000000)
+        && intRange(d.breakdown.get('activities', 0), 0, 10000000)
+        && intRange(d.breakdown.get('other', 0), 0, 10000000)
+        && strMax(d.highlights, 3000)
+        && strMax(d.tips, 1500)
+        && d.places is list && d.places.size() <= 12
+        && d.photos is list && d.photos.size() >= 1 && d.photos.size() <= 10
+        && d.source == 'manual'
+        && d.likeCount is int && d.likeCount >= 0
+        && strMax(d.authorPhoto, 500);
+    }
+    match /posts/{postId} {
+      allow read: if true;
+      allow create: if signedIn()
+        && validPost(request.resource.data)
+        && request.resource.data.uid == me()
+        && request.resource.data.likeCount == 0
+        && request.resource.data.createdAt == request.time
+        && !('updatedAt' in request.resource.data)
+        && request.resource.data.authorUsername == userDoc(me()).username
+        && request.resource.data.authorName == userDoc(me()).name;
+      allow update: if signedIn() && (
+        ( resource.data.uid == me()
+          && validPost(request.resource.data)
+          && request.resource.data.uid == resource.data.uid
+          && request.resource.data.likeCount == resource.data.likeCount
+          && request.resource.data.createdAt == resource.data.createdAt
+          && request.resource.data.updatedAt == request.time
+          && request.resource.data.authorUsername == resource.data.authorUsername
+          && request.resource.data.authorName == userDoc(me()).name )
+        ||
+        ( request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likeCount'])
+          && ( ( request.resource.data.likeCount == resource.data.likeCount + 1
+                 && !exists(likeDoc(postId)) && existsAfter(likeDoc(postId)) )
+            || ( request.resource.data.likeCount == resource.data.likeCount - 1
+                 && exists(likeDoc(postId)) && !existsAfter(likeDoc(postId)) ) ) )
+      );
+      allow delete: if signedIn() && resource.data.uid == me();
+
+      match /likes/{likerId} {
+        allow read: if true;
+        allow create: if signedIn() && likerId == me()
+          && request.resource.data.keys().hasOnly(['createdAt'])
+          && request.resource.data.createdAt == request.time
+          && getAfter(postDoc(postId)).data.likeCount == get(postDoc(postId)).data.likeCount + 1;
+        allow delete: if signedIn() && likerId == me()
+          && getAfter(postDoc(postId)).data.likeCount == get(postDoc(postId)).data.likeCount - 1;
+        allow update: if false;
+      }
+
+      match /comments/{commentId} {
+        allow read: if true;
+        allow create: if signedIn()
+          && request.resource.data.keys().hasOnly(['uid','name','username','photo','text','createdAt'])
+          && request.resource.data.uid == me()
+          && strRange(request.resource.data.text, 1, 500)
+          && request.resource.data.createdAt == request.time
+          && request.resource.data.username == userDoc(me()).username
+          && request.resource.data.name == userDoc(me()).name
+          && strMax(request.resource.data.photo, 500)
+          && exists(postDoc(postId));
+        allow delete: if signedIn() && (resource.data.uid == me() || get(postDoc(postId)).data.uid == me());
+        allow update: if false;
+      }
+    }
+
+    // ---------- reports: write-only; review them in the Firebase console ----------
+    match /reports/{reportId} {
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['postId','uid','reason','note','createdAt'])
+        && request.resource.data.uid == me()
+        && request.resource.data.postId is string && request.resource.data.postId.size() <= 64
+        && request.resource.data.reason in ['misleading','spam','inappropriate','privacy','copyright']
+        && strMax(request.resource.data.note, 300)
+        && request.resource.data.createdAt == request.time;
+      allow read, update, delete: if false;
+    }
+  }
+}
